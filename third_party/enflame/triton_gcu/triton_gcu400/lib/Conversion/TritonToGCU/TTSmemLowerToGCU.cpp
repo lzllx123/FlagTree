@@ -183,12 +183,13 @@ struct TTSmemLocalAllocOpLowering
     if (auto meshShare =
             alloc->getAttrOfType<BoolAttr>("ttg.local_alloc.mesh_share");
         meshShare && meshShare.getValue()) {
-      std::optional<Value> owner =
-          getMeshShareOwnerShard(rewriter, alloc.getLoc(), alloc.getOperation());
+      std::optional<Value> owner = getMeshShareOwnerShard(
+          rewriter, alloc.getLoc(), alloc.getOperation());
       if (!owner) {
-        alloc.emitError("ttg.local_alloc.mesh_share requires cluster dimensions "
-                        "(ttg.cluster-dims-x/y/z) to resolve the owner CTA; the "
-                        "backend cannot place the cluster-shared buffer");
+        alloc.emitError(
+            "ttg.local_alloc.mesh_share requires cluster dimensions "
+            "(ttg.cluster-dims-x/y/z) to resolve the owner CTA; the "
+            "backend cannot place the cluster-shared buffer");
         return failure();
       }
       result = rewriter
