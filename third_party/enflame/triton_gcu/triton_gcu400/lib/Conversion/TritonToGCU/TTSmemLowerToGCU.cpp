@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <utility>
 
 #include "Analysis/FirstLastUserAnalysis.h"
@@ -35,6 +36,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -42,6 +44,85 @@
 using namespace mlir;
 
 namespace {
+
+// ===----------------------------------------------------------------------===
+// Cluster-shared (mesh_share) allocation support
+// ===----------------------------------------------------------------------===
+//
+// A `ttg.local_alloc` carrying `ttg.local_alloc.mesh_share` declares a single
+// physical copy shared by the whole CTA cluster (optionally replicated per
+// coordinate on `ttg.local_alloc.mesh_axis`). GCU 400/410 reach the peer
+// shared-memory regions through `gcu.remote_memref %memref, %shard_id`, the
+// same address chain that `tle.remote(buf, shard_id)` produces (remote_memref
+// -> memref2ptr -> load/store). Routing every user of the allocation to the
+// owner's shard therefore gives the cluster-shared buffer the intended
+// one-copy semantics without a new address-space lowering.
+//
+// Every CTA still executes the `memref.alloc`; only the owner's copy is ever
+// addressed. Reclaiming the unused copies would need a conditional allocation
+// and is left as a follow-up.
+
+/// Cluster-local CTA coordinate along `dim` (0=x, 1=y, 2=z) as an i32 value.
+static Value getClusterCtaCoord(OpBuilder &b, Location loc, int32_t dim) {
+  Value coord =
+      b.create<gcu::CTAIdOp>(loc, b.getIndexType(), b.getI32IntegerAttr(dim));
+  return b.create<arith::IndexCastOp>(loc, b.getI32Type(), coord);
+}
+
+/// Linear (x-fastest) cluster shard id that owns a mesh-shared allocation.
+///
+/// The copy is replicated along `mesh_axis` and unique on every other cluster
+/// axis, so the owner keeps the CTA's coordinate on that axis and collapses
+/// the remaining axes to zero. Without a mesh axis the whole cluster shares
+/// CTA 0's copy.
+///
+/// Returns std::nullopt when the module does not carry the cluster dimensions,
+/// i.e. when the backend cannot place the buffer at all.
+static std::optional<Value> getMeshShareOwnerShard(OpBuilder &b, Location loc,
+                                                   Operation *op) {
+  ModuleOp mod = op->getParentOfType<ModuleOp>();
+  if (!mod)
+    return std::nullopt;
+  auto clusterDim = [&](StringRef name) -> std::optional<int64_t> {
+    if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
+      return attr.getInt();
+    return std::nullopt;
+  };
+  auto clusterX = clusterDim("ttg.cluster-dims-x");
+  auto clusterY = clusterDim("ttg.cluster-dims-y");
+  auto clusterZ = clusterDim("ttg.cluster-dims-z");
+  if (!clusterX || !clusterY || !clusterZ || *clusterX <= 0 || *clusterY <= 0 ||
+      *clusterZ <= 0)
+    return std::nullopt;
+
+  Value zero = b.create<arith::ConstantIntOp>(loc, 0, 32);
+  // A single CTA is trivially its own owner.
+  if (*clusterX * *clusterY * *clusterZ == 1)
+    return zero;
+
+  StringRef axis;
+  if (auto attr = op->getAttrOfType<StringAttr>("ttg.local_alloc.mesh_axis"))
+    axis = attr.getValue();
+  if (axis.empty())
+    return zero;
+
+  Value coord;
+  int64_t scale;
+  if (axis == "cluster_x") {
+    coord = getClusterCtaCoord(b, loc, 0);
+    scale = 1;
+  } else if (axis == "cluster_y") {
+    coord = getClusterCtaCoord(b, loc, 1);
+    scale = *clusterX;
+  } else if (axis == "cluster_z") {
+    coord = getClusterCtaCoord(b, loc, 2);
+    scale = *clusterX * *clusterY;
+  } else {
+    return std::nullopt;
+  }
+  return b.create<arith::MulIOp>(
+      loc, coord, b.create<arith::ConstantIntOp>(loc, scale, 32));
+}
 
 // Lower ttg.local_alloc() without input to memref.alloc with address space 2.
 // e.g. %2 = ttg.local_alloc : ()
@@ -93,8 +174,31 @@ struct TTSmemLocalAllocOpLowering
       }
     }
 
+    // Cluster-shared allocation: address the owner CTA's copy instead of this
+    // CTA's private one. The wrapped memref feeds the existing remote pointer
+    // chain (memref2ptr -> load/store), so accesses land in the owner's shared
+    // memory region. An allocation that cannot be placed must fail loudly
+    // rather than silently keep per-CTA semantics.
+    Value result = output;
+    if (auto meshShare =
+            alloc->getAttrOfType<BoolAttr>("ttg.local_alloc.mesh_share");
+        meshShare && meshShare.getValue()) {
+      std::optional<Value> owner =
+          getMeshShareOwnerShard(rewriter, alloc.getLoc(), alloc.getOperation());
+      if (!owner) {
+        alloc.emitError("ttg.local_alloc.mesh_share requires cluster dimensions "
+                        "(ttg.cluster-dims-x/y/z) to resolve the owner CTA; the "
+                        "backend cannot place the cluster-shared buffer");
+        return failure();
+      }
+      result = rewriter
+                   .create<gcu::RemoteMemRefOp>(alloc.getLoc(), memrefType,
+                                                output, *owner)
+                   .getResult();
+    }
+
     leaveTritionOp(rewriter, alloc.getOperation());
-    rewriter.replaceOp(alloc, output);
+    rewriter.replaceOp(alloc, result);
     return success();
   }
 
